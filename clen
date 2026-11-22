@@ -1,0 +1,17 @@
+import sqlite3
+from config import DB_PATH
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS users 
+            (id INTEGER PRIMARY KEY, balance REAL DEFAULT 1000)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS events 
+            (id TEXT PRIMARY KEY, title TEXT, status TEXT, yes_pool REAL DEFAULT 0, no_pool REAL DEFAULT 0)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS positions 
+            (user_id INTEGER, event_id TEXT, side TEXT, amount REAL, PRIMARY KEY (user_id, event_id, side))''')
+init_db()
