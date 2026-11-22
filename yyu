@@ -1,0 +1,144 @@
+import asyncio
+import uuid
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from config import BOT_TOKEN, ADMIN_ID
+from db import db
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+def main_kb():
+    kb = [
+        [InlineKeyboardButton(text="📊 События", callback_data="events")],
+        [InlineKeyboardButton(text="💰 Баланс", callback_data="balance")],
+        [InlineKeyboardButton(text="🏆 Топ", callback_data="top")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+@dp.message(Command("start"))
+async def start(m: types.Message):
+    with db() as conn:
+        user = conn.execute("SELECT * FROM users WHERE id=?", (m.from_user.id,)).fetchone()
+        if not user:
+            conn.execute("INSERT INTO users (id) VALUES (?)", (m.from_user.id,))
+    await m.answer("🎰 Добро пожаловать на Мем-Биржу!\nТвой стартовый баланс: 1000 коинов.", reply_markup=main_kb())
+
+@dp.callback_query(lambda c: c.data == "balance")
+async def cb_balance(c: types.CallbackQuery):
+    with db() as conn:
+        row = conn.execute("SELECT balance FROM users WHERE id=?", (c.from_user.id,)).fetchone()
+    await c.message.answer(f"💰 Твой баланс: **{row['balance']}** коинов", parse_mode="Markdown")
+    await c.answer()
+
+@dp.callback_query(lambda c: c.data == "events")
+async def cb_events(c: types.CallbackQuery):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM events WHERE status='OPEN'").fetchall()
+    if not rows:
+        await c.message.answer("На бирже пока нет активных событий.")
+    else:
+        text = "📊 **Активные события:**\n\n"
+        for r in rows:
+            text += f"🆔 `{r['id']}` — {r['title']}\n"
+            text += f"🟢 YES: {r['yes_pool']} | 🔴 NO: {r['no_pool']}\n"
+            text += f"Ставка: `/buy {r['id']} YES 100`\n\n"
+        await c.message.answer(text, parse_mode="Markdown")
+    await c.answer()
+
+@dp.callback_query(lambda c: c.data == "top")
+async def cb_top(c: types.CallbackQuery):
+    with db() as conn:
+        rows = conn.execute("SELECT id, balance FROM users ORDER BY balance DESC LIMIT 10").fetchall()
+    if not rows:
+        await c.message.answer("Пока нет игроков.")
+    else:
+        text = "🏆 **Топ богачей:**\n\n"
+        for i, r in enumerate(rows, 1):
+            text += f"{i}. `{r['id']}` — {r['balance']} коинов\n"
+        await c.message.answer(text, parse_mode="Markdown")
+    await c.answer()
+
+@dp.message(Command("balance"))
+async def balance(m: types.Message):
+    with db() as conn:
+        row = conn.execute("SELECT balance FROM users WHERE id=?", (m.from_user.id,)).fetchone()
+    await m.answer(f"💰 Твой баланс: **{row['balance'] if row else 0}** коинов", parse_mode="Markdown")
+
+@dp.message(Command("events"))
+async def events(m: types.Message):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM events WHERE status='OPEN'").fetchall()
+    if not rows:
+        return await m.answer("На бирже пока нет активных событий.")
+    text = "📊 **Активные события:**\n\n"
+    for r in rows:
+        text += f"🆔 `{r['id']}` — {r['title']}\n🟢 YES: {r['yes_pool']} | 🔴 NO: {r['no_pool']}\nСтавка: `/buy {r['id']} YES 100`\n\n"
+    await m.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("buy"))
+async def buy(m: types.Message):
+    args = m.text.split()
+    if len(args) != 4:
+        return await m.answer("Формат: /buy <ID> <YES/NO> <сумма>")
+    ev_id, side, amount_str = args[1].upper(), args[2].upper(), args[3]
+    if side not in ["YES", "NO"]:
+        return await m.answer("Ставка только YES или NO.")
+    try:
+        amount = float(amount_str)
+        if amount <= 0: raise ValueError
+    except ValueError:
+        return await m.answer("Сумма должна быть больше нуля.")
+    
+    with db() as conn:
+        ev = conn.execute("SELECT * FROM events WHERE id=? AND status='OPEN'", (ev_id,)).fetchone()
+        if not ev:
+            return await m.answer("Событие не найдено или уже закрыто.")
+        user = conn.execute("SELECT balance FROM users WHERE id=?", (m.from_user.id,)).fetchone()
+        if not user or user['balance'] < amount:
+            return await m.answer("Недостаточно коинов.")
+        conn.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (amount, m.from_user.id))
+        if side == "YES":
+            conn.execute("UPDATE events SET yes_pool = yes_pool + ? WHERE id = ?", (amount, ev_id))
+        else:
+            conn.execute("UPDATE events SET no_pool = no_pool + ? WHERE id = ?", (amount, ev_id))
+        conn.execute("INSERT OR REPLACE INTO positions (user_id, event_id, side, amount) VALUES (?, ?, ?, ?)", (m.from_user.id, ev_id, side, amount))
+    await m.answer(f"✅ Ты купил **{amount}** коинов на **{side}** в событии `{ev_id}`.", parse_mode="Markdown")
+
+@dp.message(Command("new"))
+async def new_event(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    title = m.text.replace("/new", "").strip()
+    if not title: return await m.answer("Формат: /new Будет ли понос у Димона?")
+    ev_id = str(uuid.uuid4())[:6].upper()
+    with db() as conn:
+        conn.execute("INSERT INTO events (id, title, status) VALUES (?, ?, ?)", (ev_id, title, "OPEN"))
+    await m.answer(f"🆕 Создано событие:\n🆔 `{ev_id}`\n📝 {title}", parse_mode="Markdown")
+
+@dp.message(Command("judge"))
+async def judge(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    args = m.text.split()
+    if len(args) != 3: return await m.answer("Формат: /judge <ID> <YES/NO>")
+    ev_id, outcome = args[1].upper(), args[2].upper()
+    with db() as conn:
+        ev = conn.execute("SELECT * FROM events WHERE id=? AND status='OPEN'", (ev_id,)).fetchone()
+        if not ev: return await m.answer("Не найдено или решено.")
+        win_pool = ev['yes_pool'] if outcome == "YES" else ev['no_pool']
+        lose_pool = ev['no_pool'] if outcome == "YES" else ev['yes_pool']
+        total_pool = win_pool + lose_pool
+        if win_pool > 0:
+            winners = conn.execute("SELECT user_id, amount FROM positions WHERE event_id=? AND side=?", (ev_id, outcome)).fetchall()
+            for uid, amt in winners:
+                payout = (amt / win_pool) * total_pool
+                conn.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (payout, uid))
+        conn.execute("UPDATE events SET status=? WHERE id=?", (f"RESOLVED_{outcome}", ev_id))
+    await m.answer(f"⚖️ **Суд завершен!**\nСобытие: {ev['title']}\nВердикт: **{outcome}**\nБанк: {total_pool}\nВыиграли: {win_pool}", parse_mode="Markdown")
+
+async def main():
+    print("Бот запущен.")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
